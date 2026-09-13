@@ -1,6 +1,5 @@
-import pytse_client as tse
-import pandas as pd
 import requests
+import pandas as pd
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -8,10 +7,15 @@ from concurrent.futures import ThreadPoolExecutor
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*'
+}
+
 def send_telegram_message(text):
     """ارسال پیام به تلگرام"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("خطا: تنظیمات تلگرام یافت نشد.")
+        print("تنظیمات تلگرام یافت نشد.")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -23,15 +27,12 @@ def send_telegram_message(text):
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"خطا در ارسال پیام به تلگرام: {e}")
+        print(f"خطا در ارسال به تلگرام: {e}")
 
-def calculate_fast_rsi(df, rsi_period=14, ma_period=9):
+def calculate_fast_rsi(prices, rsi_period=14, ma_period=9):
     """محاسبه RSI مطابق فرمول شما"""
-    if len(df) < rsi_period + ma_period + 1:
+    if len(prices) < rsi_period + ma_period + 5:
         return None
-
-    df = df.sort_values(by='date', ascending=True)
-    prices = df['close'].tolist()
 
     gains = []
     losses = []
@@ -73,76 +74,107 @@ def calculate_fast_rsi(df, rsi_period=14, ma_period=9):
         'ma_rsi': round(current_marsi, 1)
     }
 
-def check_symbol(symbol):
-    """بررسی فیلتر برای یک نماد"""
-    try:
-        ticker = tse.Ticker(symbol)
-        df = ticker.history
+def process_single_stock(item):
+    """دریافت ۶۰ روز قیمت برای افزایش دقت EMA"""
+    ins_code = item.get('insCode')
+    symbol = item.get('lVal18AFC')
+    title = item.get('lVal30')
+    last_price = item.get('pDrCSec')
 
-        if df.empty or len(df) < 25:
+    if not ins_code or not symbol:
+        return None
+
+    try:
+        # دریافت ۶۰ روز سابقه آخرین معاملات برای همگرایی دقیق RSI
+        history_url = f"https://cdn.tsetmc.com/api/ClosingPrice/GetClosingPriceDailyList/{ins_code}/60"
+        res = requests.get(history_url, headers=HEADERS, timeout=5)
+        
+        if res.status_code != 200:
             return None
 
-        result = calculate_fast_rsi(df)
+        daily_data = res.json().get('closingPriceDaily', [])
+        if len(daily_data) < 40:
+            return None
+
+        # مرتب‌سازی تاریخ از قدیمی به جدید
+        daily_data.sort(key=lambda x: x['dEven'])
+        prices = [d['pClosing'] for d in daily_data if d['pClosing'] > 0]
+
+        result = calculate_fast_rsi(prices)
         if not result:
             return None
 
         rsi = result['rsi']
         ma_rsi = result['ma_rsi']
 
-        # شرط فیلتر: RSI > MaRSI و RSI < 50
+        # شرط فیلتر شما: RSI > MaRSI و RSI < 50
         if rsi > ma_rsi and rsi < 50:
             return {
                 'symbol': symbol,
-                'title': ticker.title,
+                'title': title,
                 'rsi': rsi,
                 'ma_rsi': ma_rsi,
-                'last_price': ticker.last_price
+                'last_price': last_price
             }
+
     except Exception:
         return None
 
 def main():
-    print("در حال دریافت لیست تمام نمادها...")
-    all_syms = list(tse.all_symbols())
+    print("در حال دریافت دیده‌بان بازار...")
+    mw_url = "https://cdn.tsetmc.com/api/ClosingPrice/GetMarketWatch?market=0&organ=0"
     
-    # فیلتر هوشمند: حذف صندوق‌ها، اوراق قرضه، اختیار معامله و... جهت افزایش سرعت
-    ignored_keywords = ['ح', 'صندوق', 'اخزا', 'اراد', 'گام', 'ض', 'ج', 'سکه', 'مرابحه', 'تسه']
-    filtered_symbols = []
-    
-    for s in all_syms:
-        if not any(s.endswith(kw) or s.startswith(kw) for kw in ignored_keywords):
-            filtered_symbols.append(s)
+    try:
+        res = requests.get(mw_url, headers=HEADERS, timeout=15)
+        if res.status_code != 200:
+            print("خطا در دریافت دیده‌بان بازار")
+            sys.exit(1)
 
-    print(f"تعداد {len(filtered_symbols)} سهم اصلی انتخاب شد. شروع بررسی همزمان...")
+        items = res.json().get('marketWatch', [])
+        print(f"تعداد کل نمادها: {len(items)}")
 
-    filtered_list = []
-    # استفاده از ۳۰ پردازش همزمان (سرعت فوق‌العاده بالا)
-    with ThreadPoolExecutor(max_workers=30) as executor:
-        results = executor.map(check_symbol, filtered_symbols)
-        for res in results:
-            if res:
-                filtered_list.append(res)
+        ignored_keywords = ['ح', 'صندوق', 'اخزا', 'اراد', 'گام', 'ض', 'ج', 'سکه', 'مرابحه', 'تسه']
+        valid_items = []
+        
+        for item in items:
+            sym = item.get('lVal18AFC', '')
+            if sym and not any(sym.endswith(kw) or sym.startswith(kw) for kw in ignored_keywords):
+                valid_items.append(item)
 
-    print(f"پردازش تمام شد! تعداد سهم‌های سیگنال شده: {len(filtered_list)}")
+        print(f"تعداد {len(valid_items)} سهم انتخاب شد. در حال محاسبه دقیق فیلتر (۶۰ روزه)...")
 
-    if not filtered_list:
-        send_telegram_message("🤖 <b>فیلتر RSI بورس:</b>\nامروز هیچ سهمی واجد شرایط فیلتر نشد.")
-        return
+        filtered_list = []
+        with ThreadPoolExecutor(max_workers=50) as executor:
+            results = executor.map(process_single_stock, valid_items)
+            for r in results:
+                if r:
+                    filtered_list.append(r)
 
-    msg = f"🎯 <b>سیگنال فیلتر RSI بورس:</b>\n"
-    msg += f"📊 تعداد سهم‌های یافت شده: {len(filtered_list)}\n\n"
+        print(f"پردازش تمام شد! تعداد سیگنال‌ها: {len(filtered_list)}")
 
-    for item in filtered_list:
-        msg += f"🔹 <b>{item['symbol']}</b> ({item['title']})\n"
-        msg += f"├ قیمت: {item['last_price']:,} ریال\n"
-        msg += f"├ RSI (14): <code>{item['rsi']}</code>\n"
-        msg += f"└ MaRSI (9): <code>{item['ma_rsi']}</code>\n\n"
+        if not filtered_list:
+            send_telegram_message("🤖 <b>فیلتر RSI بورس (۶۰ روزه):</b>\nامروز هیچ سهمی واجد شرایط فیلتر نشد.")
+            return
 
-    if len(msg) > 4000:
-        for x in range(0, len(msg), 4000):
-            send_telegram_message(msg[x:x+4000])
-    else:
-        send_telegram_message(msg)
+        # ساخت پیام تلگرام
+        msg = f"🎯 <b>سیگنال فیلتر RSI بورس (۶۰ روزه):</b>\n"
+        msg += f"📊 تعداد سهم‌های یافت شده: {len(filtered_list)}\n\n"
+
+        for item in filtered_list:
+            msg += f"🔹 <b>{item['symbol']}</b> ({item['title']})\n"
+            msg += f"├ قیمت: {item['last_price']:,} ریال\n"
+            msg += f"├ RSI (14): <code>{item['rsi']}</code>\n"
+            msg += f"└ MaRSI (9): <code>{item['ma_rsi']}</code>\n\n"
+
+        if len(msg) > 4000:
+            for x in range(0, len(msg), 4000):
+                send_telegram_message(msg[x:x+4000])
+        else:
+            send_telegram_message(msg)
+
+    except Exception as e:
+        print(f"خطای کلی: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
