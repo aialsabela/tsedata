@@ -1,13 +1,9 @@
-name: TSETMC Scraper
+name: TSETMC Telegram Filter Bot
 
 on:
   schedule:
-    - cron: '0 9 * * 0,1,2,3,6'
+    - cron: '30 9 * * 0,1,2,3,6' # اجرای خودکار شنبه تا چهارشنبه ساعت ۱۳:۰۰ (پایان بازار)
   workflow_dispatch:
-
-# این بخش مجوز نوشتن و ذخیره فایل را صادر می‌کند
-permissions:
-  contents: write
 
 jobs:
   build:
@@ -25,13 +21,10 @@ jobs:
     - name: نصب کتابخانه‌ها
       run: |
         python -m pip install --upgrade pip
-        pip install pytse-client pandas
+        pip install pytse-client pandas requests
 
-    - name: اجرای کد
+    - name: اجرای فیلتر و ارسال به تلگرام
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: python scraper.py
-
-    - name: ذخیره و آپلود فایل در گیت‌هاب
-      uses: stefanzweifel/git-auto-commit-action@v5
-      with:
-        commit_message: بروزرسانی داده‌های بورس
-        file_pattern: 'market_data.csv'
