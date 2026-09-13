@@ -2,14 +2,18 @@ import requests
 import pandas as pd
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+# هدرهای کاملاً طبیعی برای جلوگیری از بلاک شدن توسط فایروال TSETMC
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Referer': 'https://main.tsetmc.com/',
+    'Origin': 'https://main.tsetmc.com'
 }
 
 def send_telegram_message(text):
@@ -30,7 +34,7 @@ def send_telegram_message(text):
         print(f"خطا در ارسال به تلگرام: {e}")
 
 def calculate_fast_rsi(prices, rsi_period=14, ma_period=9):
-    """محاسبه RSI مطابق فرمول شما"""
+    """محاسبه دقیق RSI و MaRSI مطابق فرمول شما"""
     if len(prices) < rsi_period + ma_period + 5:
         return None
 
@@ -75,7 +79,7 @@ def calculate_fast_rsi(prices, rsi_period=14, ma_period=9):
     }
 
 def process_single_stock(item):
-    """دریافت ۶۰ روز قیمت برای افزایش دقت EMA"""
+    """دریافت سابقه ۶۰ روزه با کنترل سرعت درخواست‌ها"""
     ins_code = item.get('insCode')
     symbol = item.get('lVal18AFC')
     title = item.get('lVal30')
@@ -85,9 +89,10 @@ def process_single_stock(item):
         return None
 
     try:
-        # دریافت ۶۰ روز سابقه آخرین معاملات برای همگرایی دقیق RSI
         history_url = f"https://cdn.tsetmc.com/api/ClosingPrice/GetClosingPriceDailyList/{ins_code}/60"
-        res = requests.get(history_url, headers=HEADERS, timeout=5)
+        
+        # ارسال درخواست مستقیم
+        res = requests.get(history_url, headers=HEADERS, timeout=10)
         
         if res.status_code != 200:
             return None
@@ -96,7 +101,6 @@ def process_single_stock(item):
         if len(daily_data) < 40:
             return None
 
-        # مرتب‌سازی تاریخ از قدیمی به جدید
         daily_data.sort(key=lambda x: x['dEven'])
         prices = [d['pClosing'] for d in daily_data if d['pClosing'] > 0]
 
@@ -107,7 +111,7 @@ def process_single_stock(item):
         rsi = result['rsi']
         ma_rsi = result['ma_rsi']
 
-        # شرط فیلتر شما: RSI > MaRSI و RSI < 50
+        # شرط فیلتر: RSI > MaRSI و RSI < 50
         if rsi > ma_rsi and rsi < 50:
             return {
                 'symbol': symbol,
@@ -121,18 +125,20 @@ def process_single_stock(item):
         return None
 
 def main():
-    print("در حال دریافت دیده‌بان بازار...")
+    print("در حال دریافت دیده‌بان بازار از CDN اصلی TSETMC...")
     mw_url = "https://cdn.tsetmc.com/api/ClosingPrice/GetMarketWatch?market=0&organ=0"
     
     try:
         res = requests.get(mw_url, headers=HEADERS, timeout=15)
         if res.status_code != 200:
-            print("خطا در دریافت دیده‌بان بازار")
+            print(f"خطا در دریافت دیده‌بان: کد {res.status_code}")
             sys.exit(1)
 
-        items = res.json().get('marketWatch', [])
-        print(f"تعداد کل نمادها: {len(items)}")
+        data = res.json()
+        items = data.get('marketWatch', [])
+        print(f"تعداد کل نمادهای دریافتی: {len(items)}")
 
+        # فیلتر کردن نمادهای غیر سهمی
         ignored_keywords = ['ح', 'صندوق', 'اخزا', 'اراد', 'گام', 'ض', 'ج', 'سکه', 'مرابحه', 'تسه']
         valid_items = []
         
@@ -141,16 +147,17 @@ def main():
             if sym and not any(sym.endswith(kw) or sym.startswith(kw) for kw in ignored_keywords):
                 valid_items.append(item)
 
-        print(f"تعداد {len(valid_items)} سهم انتخاب شد. در حال محاسبه دقیق فیلتر (۶۰ روزه)...")
+        print(f"تعداد {len(valid_items)} سهم انتخاب شد. محاسبه بدون فشار به سرور...")
 
         filtered_list = []
-        with ThreadPoolExecutor(max_workers=50) as executor:
+        # کاهش سرعت درخواست‌ها به ۵ درخواست همزمان جهت جلوگیری از مسدود شدن IP
+        with ThreadPoolExecutor(max_workers=5) as executor:
             results = executor.map(process_single_stock, valid_items)
             for r in results:
                 if r:
                     filtered_list.append(r)
 
-        print(f"پردازش تمام شد! تعداد سیگنال‌ها: {len(filtered_list)}")
+        print(f"پردازش با موفقیت تمام شد! تعداد سیگنال‌ها: {len(filtered_list)}")
 
         if not filtered_list:
             send_telegram_message("🤖 <b>فیلتر RSI بورس (۶۰ روزه):</b>\nامروز هیچ سهمی واجد شرایط فیلتر نشد.")
